@@ -16,6 +16,7 @@ from typing import (
     Optional,
     Generator,
 )
+import requests.exceptions
 
 from docker.client import DockerClient
 from docker.models.containers import Container
@@ -69,6 +70,13 @@ class UnexpectedProposeOutputFormatError(Exception):
     def __init__(self, output: str) -> None:
         super().__init__()
         self.output = output
+
+
+class NonZeroContainerExitCodeError(Exception):
+    def __init__(self, container_name: str, exit_code: int) -> None:
+        super().__init__()
+        self.container_name = container_name
+        self.exit_code = exit_code
 
 
 def extract_block_count_from_show_blocks(show_blocks_output: str) -> int:
@@ -131,6 +139,16 @@ class Node:
 
     def get_metrics(self):
         return self.shell_out('curl', '-s', 'http://localhost:40403/metrics')
+
+    def ensure_zero_exit_code(self) -> None:
+        try:
+            status = self.container.wait(timeout=1)
+        except requests.exceptions.ReadTimeout:
+            # Container is still running: let the test case body decide whether the test succeeded or not
+            return
+        exit_code = status.get('StatusCode', 0)
+        if exit_code != 0:
+            raise NonZeroContainerExitCodeError(self.container.name, exit_code)
 
     def cleanup(self) -> None:
         self.container.remove(force=True, v=True)
@@ -563,6 +581,7 @@ def started_bootstrap_node(*, context: TestingContext, network, mount_dir: str =
         wait_for_node_started(context, bootstrap_node)
         wait_for_approved_block_received_handler_state(context, bootstrap_node)
         yield bootstrap_node
+        bootstrap_node.ensure_zero_exit_code()
     finally:
         bootstrap_node.cleanup()
 
