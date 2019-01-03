@@ -140,6 +140,14 @@ class Node:
     def get_metrics(self):
         return self.shell_out('curl', '-s', 'http://localhost:40403/metrics')
 
+    def get_connected_peers_metric_value(self):
+        try:
+            return self.shell_out('sh', '-c', 'curl -s http://localhost:40403/metrics | grep ^rchain_comm_rp_connect_peers\\ ')
+        except NonZeroExitCodeError as e:
+            if e.exit_code == 1:
+                return ''
+            raise
+
     def ensure_zero_exit_code(self) -> None:
         try:
             status = self.container.wait(timeout=1)
