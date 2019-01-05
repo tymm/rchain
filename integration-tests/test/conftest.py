@@ -78,7 +78,7 @@ def temporary_bonds_file(random_generator: random.Random, validator_keys: List[K
         os.unlink(file)
 
 
-@pytest.yield_fixture(scope='session')
+@pytest.yield_fixture(scope='function')
 def docker_client() -> Generator[DockerClient, None, None]:
     docker_client = docker_py.from_env()
     try:
@@ -120,7 +120,7 @@ def testing_context(command_line_options: CommandLineOptions, docker_client: Doc
 testing_context.__test__ = False
 
 
-@pytest.yield_fixture(scope='module')
+@pytest.yield_fixture(scope='function')
 def started_standalone_bootstrap_node(command_line_options: CommandLineOptions, docker_client: DockerClient) -> Node:
     with testing_context(command_line_options, docker_client) as context:
         with docker_network_with_started_bootstrap(context=context) as bootstrap_node:
