@@ -49,6 +49,7 @@ object GroundNormalizeMatcher {
   // expression because they're always there.
   def stripUri(raw: String): String = {
     require(raw.length >= 2)
+    println("asd")
     raw.substring(1, raw.length - 1)
   }
   // Similarly, we need to remove quotes from strings, since we are using
