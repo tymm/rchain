@@ -5,12 +5,18 @@ import cats.data._
 import cats.laws.discipline.MonadTests
 import cats.mtl.laws.discipline.MonadStateTests
 import cats.tests.CatsSuite
+import coop.rchain.models.Expr.ExprInstance.{EVarBody, GBool, GInt, GString}
+import coop.rchain.models.Var.VarInstance.{BoundVar, FreeVar}
+import coop.rchain.models._
+import coop.rchain.models.rholang.implicits._
+import coop.rchain.rholang.interpreter.PrettyPrinter
 import org.scalacheck.rng.Seed
 import org.scalatest.prop.PropertyChecks
 import org.scalatest.{FlatSpec, Matchers}
+import cats.implicits._
 
 import scala.annotation.tailrec
-import scala.util.{Failure, Success, Try}
+import scala.util.{Failure, Random, Success, Try}
 
 class SubSpec extends FlatSpec with Matchers with PropertyChecks {
 
@@ -32,18 +38,140 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
     case Ref(n)       => s"$n"
   }
 
+  def print(e: New): String = PrettyPrinter().buildString(e)
+
   import GenInstances._
 
-  type Env           = List[Char]
+  type BindCount     = Int
+  type Size          = Int
+  type Env           = (BindCount, Size)
   type EnvT[F[_], A] = ReaderT[F, Env, A]
   type ArbEnv[A]     = ArbF[EnvT, A]
 
   object ArbEnv extends GenericArb[EnvT] {
-    override def defer                               = Defer[EnvT[Gen, ?]]
-    override def monad                               = Monad[EnvT[Gen, ?]]
-    override def liftF[A](gen: Gen[A]): EnvT[Gen, A] = ReaderT.liftF(gen)
+    override def defer                                          = Defer[EnvT[Gen, ?]]
+    override def monad                                          = Monad[EnvT[Gen, ?]]
+    override def liftF[A](gen: Gen[A]): EnvT[Gen, A]            = ReaderT.liftF(gen)
   }
 
+  case class Shape(breadth: Int, depths: List[Size]) {
+    assert(breadth == depths.length)
+  }
+
+  def split[T](list: List[T], chunks: Int): List[List[T]] = {
+    @tailrec
+    def split(list: List[T], chunks: Int, size: Int, result: List[List[T]]): List[List[T]] =
+      if (chunks == 0) result
+      else if (chunks == 1) list +: result
+      else {
+        val avg = size / chunks
+        val rand = (1.0 + Random.nextGaussian / 3) * avg
+        val index = (rand.toInt max 1) min (size - chunks)
+        val (h, t) = list splitAt index
+        split(t, chunks - 1, size - index, h +: result)
+      }
+    split(list, chunks, list.size, Nil).reverse
+  }
+
+  def genShape(size: Size): EnvT[Gen, Shape] = ArbEnv.liftF(
+    for {
+      breadth <- Gen.chooseNum(1, size)
+      leftover = size - breadth
+      depths = split(List.fill(leftover)(1), breadth).map(_.sum)
+    } yield Shape(breadth, depths)
+  )
+
+  def emptyListOf[T]: EnvT[Gen, List[T]] = ArbEnv.liftF(Gen.const(List[T]()))
+
+  def genName(bindCount: BindCount): EnvT[Gen, Int] = ArbEnv.liftF(Gen.chooseNum(0, bindCount - 1))
+
+  // Currently just creates a pattern with just one free var but could be used to create a pattern specific to a name
+  def genPattern(name: BindCount): EnvT[Gen, Par] = ArbEnv.liftF(Gen.const(EVar(FreeVar(0))))
+
+  implicit val arbFExpr: ArbF[EnvT, Expr] = ArbF[EnvT, Expr]{
+    val genInt: Gen[GInt] = Gen.chooseNum(-5, 5).map(i => GInt(i.toLong))
+    val genBool: Gen[GBool] = Gen.oneOf(GBool(true), GBool(false))
+    val genString: Gen[GString] = Arbitrary.arbString.arbitrary.map(GString)
+    ArbEnv.liftF(
+      Gen.oneOf(
+        genInt.map(Expr(_)),
+        genString.map(Expr(_)),
+        genBool.map(Expr(_))
+      )
+    )
+  }
+
+  implicit val arbFSend: ArbF[EnvT, Send] = ArbF[EnvT, Send](
+    for {
+      env               <- ReaderT.ask[Gen, Env]
+      (bindCount, size) = env
+
+      name <- genName(bindCount)
+      expr <- ArbF.arbF[EnvT, Expr]
+    } yield Send(chan = EVar(BoundVar(name)), data = List(expr))
+  )
+
+  implicit val arbFReceiveBind: ArbF[EnvT, ReceiveBind] = ArbF[EnvT, ReceiveBind](
+    for {
+      env               <- ReaderT.ask[Gen, Env]
+      (bindCount, size) = env
+
+      name <- genName(bindCount)
+      pattern <- genPattern(name)
+    } yield ReceiveBind(patterns = Seq(pattern), source = EVar(BoundVar(name)), freeCount = 1)
+  )
+
+  implicit val arbFReceive: ArbF[EnvT, Receive] = ArbF[EnvT, Receive](
+    for {
+      env       <- ReaderT.ask[Gen, Env]
+      (bindCount, size) = env
+
+      bind <- ArbF.arbF[EnvT, ReceiveBind]
+      body <- ReaderT.local{env: Env => (env._1, env._2 - 1)}(ArbF.arbF[EnvT, Par])
+    } yield Receive(binds = Seq(bind), body = body)
+  )
+
+  implicit val arbFPar: ArbF[EnvT, Par] = ArbF[EnvT, Par](
+    for {
+      env               <- ReaderT.ask[Gen, Env]
+      (bindCount, size) = env
+
+      par <- if (size > 0) {
+        for {
+          nReceives <- ArbEnv.liftF(Gen.chooseNum(0, size))
+          nSends    = size - nReceives
+
+          receives <- if (nReceives > 0) {
+            for {
+              shape <- genShape(nReceives)
+              r <- shape.depths.map(d => ReaderT.local{env: Env => (env._1, d)}(ArbF.arbF[EnvT, Receive])).sequence
+            } yield r
+          } else emptyListOf[Receive]
+
+          sends <- if (nSends > 0) {
+            for {
+              shape <- genShape(nSends)
+              s <- shape.depths.map(d => ReaderT.local{env: Env => (env._1, d)}(ArbF.arbF[EnvT, Send])).sequence
+            } yield s
+          } else emptyListOf[Send]
+
+        } yield Par(sends = sends, receives = receives)
+      } else {
+        ArbEnv.liftF(Gen.const(Par()))
+      }
+
+    } yield par
+  )
+
+  implicit val arbFNew: ArbF[EnvT, New] = ArbF[EnvT, New](
+    for {
+      env            <- ReaderT.ask[Gen, Env]
+      (bindCount, _) = env
+      par            <- ArbF.arbF[EnvT, Par]
+    } yield New(bindCount = bindCount, p = par)
+  )
+
+  /*
   object Exp extends ExpLowPrio {
 
     implicit val arbFRef = {
@@ -75,12 +203,13 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
   }
 
   import Exp._
+  */
 
-  case class ValidExp(e: Exp)
+  case class ValidExp(e: New)
 
-  implicit def validExp(implicit ev: ArbEnv[Exp]): Arbitrary[ValidExp] =
+  implicit def validExp(implicit ev: ArbEnv[New]): Arbitrary[ValidExp] =
     Arbitrary(
-      ev.arb.run(List.empty).map(ValidExp)
+      ev.arb.run((5,2)).map(ValidExp)
     )
 
   implicit override val generatorDrivenConfig: PropertyCheckConfiguration =
