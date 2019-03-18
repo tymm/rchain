@@ -83,10 +83,16 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
   implicit val arbFReceive: ArbF[EnvT, Receive] = ArbF[EnvT, Receive](Defer[EnvT[Gen, ?]].defer {
     for {
       bind <- ArbF.arbF[EnvT, ReceiveBind]
-      // TODO: Choose between Par and Match
-      body <- ReaderT.local { env: Env =>
+      matchGen = ReaderT.local { env: Env =>
         (env._1 + bind.freeCount, env._2 - 1)
-      }(ArbF.arbF[EnvT, Match])
+      }(ArbF.arbF[EnvT, Match]).asPar()
+
+      parGen = ReaderT.local { env: Env =>
+        (env._1 + bind.freeCount, env._2 - 1)
+      }(ArbF.arbF[EnvT, Par])
+
+      body <- frequency((3, parGen), (1, matchGen))
+
     } yield Receive(binds = List(bind), body = body)
   })
 
@@ -170,6 +176,13 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
 
   private def genPattern(name: BindCount): EnvT[Gen, Par] = ArbEnv.liftF(Gen.const(EVar(FreeVar(0))))
 
+  private def frequency[T](gs: (Int, EnvT[Gen, T])*): EnvT[Gen, T] = {
+    def zip(listT: Seq[T], ints: Seq[Int]): List[(Int, Gen[T])] = ints.zip(listT.map(t => Gen.const(t))).toList
+    val sequenced = gs.map{case (_, envT) => envT}.toList.sequence
+    val frequencies = gs.map{case (i, _) => i}
+    sequenced.flatMapF(listT => Gen.frequency(zip(listT, frequencies): _*))
+  }
+
   // Taken from: https://stackoverflow.com/questions/40958670/split-a-list-into-a-fixed-number-of-random-sized-sub-lists
   private def split[T](list: List[T], chunks: Int): List[List[T]] = {
     @tailrec
@@ -184,6 +197,10 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
         split(t, chunks - 1, size - index, h +: result)
       }
     split(list, chunks, list.size, Nil).reverse
+  }
+
+  implicit class RichMatch(val a: EnvT[Gen, Match]) {
+    def asPar(): EnvT[Gen, Par] = a.map(m => Par(matches = List(m)))
   }
 
   case class ValidExp(e: New)
