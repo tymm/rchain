@@ -30,30 +30,45 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
   type BindCount     = Int
   type VarCount      = Int
   type Size          = Int
-  type Env           = (BindCount, VarCount, Size)
-  type EnvT[F[_], A] = ReaderT[F, Env, A]
+  type Env           = (BindCount, VarCount, Size, Scope)
+  type EnvT[F[_], A] = ReaderT[StateT[F, State, ?], Env, A]
+  type Name          = Int
+  type State         = Map[Name, Attrs]
+  type Scope         = Map[Name, Attrs]
   type ArbEnv[A]     = ArbF[EnvT, A]
+
+  case class Attrs(readOnly: Boolean = false, writeOnly: Boolean = false)
 
   object ArbEnv extends GenericArb[EnvT] {
     override def defer                               = Defer[EnvT[Gen, ?]]
     override def monad                               = Monad[EnvT[Gen, ?]]
-    override def liftF[A](gen: Gen[A]): EnvT[Gen, A] = ReaderT.liftF(gen)
-    def ask: EnvT[Gen, Env]                          = ReaderT.ask[Gen, Env]
-    def askBindCount: EnvT[Gen, BindCount]           = ReaderT.ask[Gen, Env].map(_._1)
-    def askVarCount: EnvT[Gen, VarCount]             = ReaderT.ask[Gen, Env].map(_._2)
-    def askSize: EnvT[Gen, Size]                     = ReaderT.ask[Gen, Env].map(_._3)
+    override def liftF[A](gen: Gen[A]): EnvT[Gen, A] =
+      ReaderT.liftF[StateT[Gen, State, ?], Env, A](StateT.liftF[Gen, State, A](gen))
+    def ask: EnvT[Gen, Env]                        = ReaderT.ask[StateT[Gen, State, ?], Env]
+    def askVarCount: EnvT[Gen, VarCount]         = ReaderT.ask[StateT[Gen, State, ?], Env].map(_._2)
+    def askBindCount: EnvT[Gen, BindCount]         = ReaderT.ask[StateT[Gen, State, ?], Env].map(_._1)
+    def askSize: EnvT[Gen, Size]         = ReaderT.ask[StateT[Gen, State, ?], Env].map(_._3)
+    def askScope: EnvT[Gen, Scope]         = ReaderT.ask[StateT[Gen, State, ?], Env].map(_._4)
+    def modify(f: State => State): EnvT[Gen, Unit] = ReaderT.liftF(StateT.modify(f))
+    def get: EnvT[Gen, State]                      = ReaderT.liftF(StateT.get)
+    def pure: EnvT[Gen, Unit]                      = ReaderT.liftF[StateT[Gen, State, ?], Env, Unit](StateT.pure(()))
   }
 
   case class Shape(breadth: Int, depths: List[Size]) {
     assert(breadth == depths.length)
   }
 
-  val setSize      = (size: Size) => (env: Env) => (env._1, env._2, size)
-  val setBindCount = (bindCount: BindCount) => (env: Env) => (bindCount, env._2, env._3)
-  val setVarCount  = (varCount: VarCount) => (env: Env) => (env._1, varCount, env._3)
-  val decreaseSize = (env: Env) => (env._1, env._2, env._3 - 1)
-  val addFreeVars = (freeCount: Int) =>
-    (env: Env) => (env._1 + freeCount, env._2 + freeCount, env._3)
+  val setSize      = (size: Size) => (env: Env) => (env._1, env._2, size, env._4)
+  val setBindCount = (bindCount: BindCount) => (env: Env) => (bindCount, env._2, env._3, env._4)
+  val setVarCount  = (varCount: VarCount) => (env: Env) => (env._1, varCount, env._3, env._4)
+  val decreaseSize = (env: Env) => (env._1, env._2, env._3 - 1, env._4)
+  val addFreeVars = (freeCount: Int) => (env: Env) => (env._1 + freeCount, env._2 + freeCount, env._3, env._4)
+
+  implicit val arbFBundle: ArbF[EnvT, Bundle] = ArbF[EnvT, Bundle](Defer[EnvT[Gen, ?]].defer {
+    for {
+      name <- genName
+    } yield Bundle(body = EVar(BoundVar(name)), readFlag = true)
+  })
 
   implicit val arbFExpr: ArbF[EnvT, Expr] = ArbF[EnvT, Expr](Defer[EnvT[Gen, ?]].defer {
     val genInt: Gen[GInt]       = Gen.chooseNum(-5, 5).map(i => GInt(i.toLong))
@@ -70,31 +85,72 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
     )
   })
 
+  private def sendBundle(
+      name: Int,
+      readFlag: Boolean,
+      writeFlag: Boolean
+  ): EnvT[Gen, Unit] =
+  {
+    for {
+    // mark process send on `name` as a read-only bundle
+    _ <- ArbEnv.modify { state =>
+          val procAttrs    = state.get(name).map(_.copy(readOnly = true))
+          val newProcAttrs = procAttrs.getOrElse(Attrs(readOnly = true))
+          state.updated(name, newProcAttrs)
+        }
+  } yield ()
+  }
+
+  private def genNameSend: EnvT[Gen, Name] =
+    for {
+      bindCount <- ArbEnv.askBindCount
+      scope <- ArbEnv.askScope
+
+      allNames = 0 until bindCount
+      readOnlyNames = scope.filter{ case (_, attrs) => !attrs.readOnly }.map{ case (name, _) => name }.toList
+      names = allNames.diff(readOnlyNames)
+
+      name <- ArbEnv.liftF(Gen.oneOf(names))
+    } yield name
+
   implicit val arbFSend: ArbF[EnvT, Send] = ArbF[EnvT, Send](Defer[EnvT[Gen, ?]].defer {
     for {
-      name <- genName
-      expr <- ArbF.arbF[EnvT, Expr]
-    } yield Send(chan = EVar(BoundVar(name)), data = List(expr))
+      name      <- genNameSend
+      exprGen   = ArbF.arbF[EnvT, Expr]
+      bundleGen = ArbF.arbF[EnvT, Bundle] <* sendBundle(name, readFlag = true, writeFlag = false)
+      data      <- frequency((0, exprGen.asPar), (1, bundleGen.asPar))
+    } yield Send(chan = EVar(BoundVar(name)), data = List(data))
   })
 
-  implicit val arbFReceiveBind: ArbF[EnvT, ReceiveBind] =
-    ArbF[EnvT, ReceiveBind](Defer[EnvT[Gen, ?]].defer {
+  implicit val arbFReceiveBind: ArbF[EnvT, (ReceiveBind, Env => Env)] =
+    ArbF[EnvT, (ReceiveBind, Env => Env)](Defer[EnvT[Gen, ?]].defer {
       for {
         name                 <- genName
         r                    <- genPattern(name)
         (pattern, freeCount) = r
-      } yield
-        ReceiveBind(patterns = List(pattern), source = EVar(BoundVar(name)), freeCount = freeCount)
+        isReadOnlyName <- ArbEnv.get.map(m => m.get(name).exists(attrs => attrs.readOnly))
+        addReadOnlyFreeVar = (env: Env) => if (isReadOnlyName) {
+          val freeVar = name + 1 // TODO
+          val procAttrs    = env._4.get(freeVar).map(_.copy(readOnly = true))
+          val newProcAttrs = procAttrs.getOrElse(Attrs(readOnly = true))
+          val newScope = env._4.updated(name, newProcAttrs)
+          (env._1, env._2, env._3, newScope)
+        } else env
+      } yield (ReceiveBind(patterns = List(pattern), source = EVar(BoundVar(name)), freeCount = freeCount), addReadOnlyFreeVar)
     })
 
   implicit val arbFReceive: ArbF[EnvT, Receive] = ArbF[EnvT, Receive](Defer[EnvT[Gen, ?]].defer {
     for {
-      bind <- ArbF.arbF[EnvT, ReceiveBind]
-      matchGen = ReaderT
-        .local(addFreeVars(bind.freeCount) andThen decreaseSize)(ArbF.arbF[EnvT, Match])
-        .asPar()
+      receiveBind <- ArbF.arbF[EnvT, (ReceiveBind, Env => Env)]
+      (bind, applyScope) = receiveBind
 
-      parGen = ReaderT.local(addFreeVars(bind.freeCount) andThen decreaseSize)(ArbF.arbF[EnvT, Par])
+      matchGen = ReaderT
+        .local(addFreeVars(bind.freeCount) andThen decreaseSize andThen applyScope)(ArbF.arbF[EnvT, Match])
+        .asPar
+
+      parGen = ReaderT.local(addFreeVars(bind.freeCount) andThen decreaseSize andThen applyScope)(ArbF.arbF[EnvT, Par])
+      receiveBind <- ArbF.arbF[EnvT, (ReceiveBind, Env => Env)]
+      (bind, applyScope) = receiveBind
 
       body         <- frequency((3, parGen), (1, matchGen))
       isPersistent <- ArbEnv.liftF(Gen.oneOf(true, false))
@@ -189,7 +245,7 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
       ints.zip(listT.map(t => Gen.const(t))).toList
     val sequenced   = gs.map { case (_, envT) => envT }.toList.sequence
     val frequencies = gs.map { case (i, _) => i }
-    sequenced.flatMapF(listT => Gen.frequency(zip(listT, frequencies): _*))
+    sequenced.flatMapF(listT => StateT.liftF(Gen.frequency(zip(listT, frequencies): _*)))
   }
 
   // Taken from: https://stackoverflow.com/questions/40958670/split-a-list-into-a-fixed-number-of-random-sized-sub-lists
@@ -213,7 +269,16 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
   private def emptyList[T]: EnvT[Gen, List[T]] = ArbEnv.liftF(Gen.const(List[T]()))
 
   implicit class RichMatch(val a: EnvT[Gen, Match]) {
-    def asPar(): EnvT[Gen, Par] = a.map(m => Par(matches = List(m)))
+    //def asPar: EnvT[Gen, Par] = a.map(m => Par(matches = List(m)))
+    def asPar: EnvT[Gen, Par] = a.map(m => Par(matches = List(m)))
+  }
+
+  implicit class RichExpr(val a: EnvT[Gen, Expr]) {
+    def asPar: EnvT[Gen, Par] = a.map(e => Par(exprs = List(e)))
+  }
+
+  implicit class RichBundle(val a: EnvT[Gen, Bundle]) {
+    def asPar: EnvT[Gen, Par] = a.map(b => Par(bundles = List(b)))
   }
 
   case class ValidExp(e: New)
@@ -221,7 +286,7 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
   implicit def validExp(implicit ev: ArbEnv[New]): Arbitrary[ValidExp] =
     Arbitrary(
       // Run with 5 names introduced by initial `new` and a size of 4
-      ev.arb.run((5, 4, 4)).map(ValidExp)
+      ev.arb.run((5, 4, 4, Map())).runA(Map()).map(ValidExp)
     )
 
   implicit override val generatorDrivenConfig: PropertyCheckConfiguration =
