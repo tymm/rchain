@@ -269,7 +269,6 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
   private def emptyList[T]: EnvT[Gen, List[T]] = ArbEnv.liftF(Gen.const(List[T]()))
 
   implicit class RichMatch(val a: EnvT[Gen, Match]) {
-    //def asPar: EnvT[Gen, Par] = a.map(m => Par(matches = List(m)))
     def asPar: EnvT[Gen, Par] = a.map(m => Par(matches = List(m)))
   }
 
@@ -285,8 +284,8 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
 
   implicit def validExp(implicit ev: ArbEnv[New]): Arbitrary[ValidExp] =
     Arbitrary(
-      // Run with 5 names introduced by initial `new` and a size of 4
-      ev.arb.run((5, 4, 4, Map())).runA(Map()).map(ValidExp)
+      // Run with 5 names introduced by initial `new` and a size of 10
+      ev.arb.run((5, 5, 10, Map())).runA(Map()).map(ValidExp)
     )
 
   implicit override val generatorDrivenConfig: PropertyCheckConfiguration =
