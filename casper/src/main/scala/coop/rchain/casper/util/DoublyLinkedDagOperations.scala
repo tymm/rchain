@@ -64,7 +64,8 @@ object DoublyLinkedDagOperations {
     val parentToChildAdjacencyList: Map[A, Set[A]] = dag.parentToChildAdjacencyList
     val childToParentAdjacencyList: Map[A, Set[A]] = dag.childToParentAdjacencyList
     assert(!childToParentAdjacencyList.contains(element))
-    assert(!parentToChildAdjacencyList.values.toSet.contains(element))
+    assert(!parentToChildAdjacencyList.values.toSet.contains(Set(element)))
+    assert(!parentToChildAdjacencyList.values.exists(_ == Set(element)))
     val maybeChildren = parentToChildAdjacencyList.get(element)
     val initAcc       = (childToParentAdjacencyList, Set.empty[A])
     val (updatedChildToParentAdjacencyList, newDependencyFree) = maybeChildren match {

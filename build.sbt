@@ -391,6 +391,8 @@ lazy val rholang = (project in file("rholang"))
       catsMtl,
       catsEffect,
       monix,
+      monocleCore,
+      monocleMacro,
       scallop,
       lightningj,
       catsLawsTest,
