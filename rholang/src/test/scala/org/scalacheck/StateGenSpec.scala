@@ -63,12 +63,20 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
     def hasReadOnly(varRef: VarRef): EnvT[Gen, Boolean] =
       ArbEnv.getAttributeStore.map(store => store(varRef).hasReadOnly)
 
+    def hasWriteOnly(varRef: VarRef): EnvT[Gen, Boolean] =
+      ArbEnv.getAttributeStore.map(store => store(varRef).hasWriteOnly)
+
     def isAssumeWriteOnly(varRef: VarRef): EnvT[Gen, Boolean] =
       ArbEnv.getAttributeStore.map(store => store(varRef).assumeWritable)
 
     def setReadOnlyFlag(varRef: VarRef): EnvT[Gen, Unit] =
       ArbEnv.modifyAttributeStore(
         store => store ++ Map(varRef -> store(varRef).copy(readOnly = true))
+      )
+
+    def setWriteOnlyFlag(varRef: VarRef): EnvT[Gen, Unit] =
+      ArbEnv.modifyAttributeStore(
+        store => store ++ Map(varRef -> store(varRef).copy(writeOnly = true))
       )
 
     def addPattern(pattern: VarRef, source: VarRef): EnvT[Gen, Unit] =
@@ -91,6 +99,14 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
           Attributes
         ](
           _.hasReadOnly
+        )).set(true)(state)
+
+      def setHasWriteOnly(varRef: VarRef): Map[VarRef, Attributes] =
+        (Iso
+          .id[Map[VarRef, Attributes]] composeOptional index(varRef) composeLens GenLens[
+          Attributes
+        ](
+          _.hasWriteOnly
         )).set(true)(state)
     }
   }
@@ -143,12 +159,17 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
   val setLevel = (level: Level) => (env: Env) => env.copy(_2 = level)
   val setScope = (scope: Scope) => (env: Env) => env.copy(_4 = scope)
 
-  implicit val arbFBundle: ArbF[EnvT, Bundle] = ArbF[EnvT, Bundle](Defer[EnvT[Gen, ?]].defer {
-    for {
-      name <- genName
-      boundVar <- unsafeGetBoundVar(name)
-    } yield Bundle(body = EVar(boundVar), readFlag = true)
-  })
+  implicit val arbFBundle: ArbF[EnvT, Bundle] = {
+
+    ArbF[EnvT, Bundle](Defer[EnvT[Gen, ?]].defer {
+      for {
+        name <- genName
+        boundVar <- unsafeGetBoundVar(name)
+        readFlag <- ArbEnv.liftF(Gen.oneOf(true, false))
+        writeFlag <- ArbEnv.liftF(Gen.oneOf(true, false))
+      } yield Bundle(body = EVar(boundVar), readFlag = readFlag, writeFlag = writeFlag)
+    })
+  }
 
   implicit val arbFExpr: ArbF[EnvT, Expr] = ArbF[EnvT, Expr](Defer[EnvT[Gen, ?]].defer {
     val genInt: Gen[GInt]       = Gen.chooseNum(-5, 5).map(i => GInt(i.toLong))
@@ -199,12 +220,30 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
     }
 
     def genSendData(chan: VarRef): EnvT[Gen, List[Par]] = {
-      // TODO: add write-only bundles
       def flagChannel(
-          varRef: VarRef
-      ): EnvT[Gen, Unit] = ArbEnv.modifyAttributeStore(_.setHasReadOnly(varRef))
+                       varRef: VarRef,
+                       writeFlag: Boolean,
+                       readFlag: Boolean
+                     ): EnvT[Gen, Unit] = {
+        if (writeFlag && !readFlag)
+        // bundle+
+          ArbEnv.modifyAttributeStore(_.setHasWriteOnly(varRef))
+        else if(!writeFlag && readFlag)
+        // bundle-
+          ArbEnv.modifyAttributeStore(_.setHasReadOnly(varRef))
+        else if (!writeFlag && !readFlag)
+        // bundle0
+          ArbEnv.modifyAttributeStore(ref => ref.setHasReadOnly(varRef).setHasWriteOnly(varRef))
+        else
+        // bundle
+          ArbEnv.pure
+      }
+
       val exprGen = ArbF.arbF[EnvT, Expr]
-      val bundleGen = ArbF.arbF[EnvT, Bundle] <* flagChannel(chan)
+      val bundleGen = for {
+        bundle <- ArbF.arbF[EnvT, Bundle]
+        _ <- flagChannel(chan, bundle.writeFlag, bundle.readFlag)
+      } yield bundle
 
       FlatMap[EnvT[Gen, ?]].ifM(Attributes.isAssumeWriteOnly(chan))(
         ifTrue = frequency((1, exprGen.asPar), (0, bundleGen.asPar)),
@@ -242,43 +281,67 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
     })
   }
 
-  implicit val arbFReceive: ArbF[EnvT, Receive] = {
-    def genReceiveBind: EnvT[Gen, (ReceiveBind, VarRef)] = {
+  implicit val arbFReceive: ArbF[EnvT, Option[Receive]] = {
+    def genReceiveBind: EnvT[Gen, Option[(ReceiveBind, VarRef)]] = {
+      val readableVars: EnvT[Gen, List[VarRef]] =
+        for {
+          store <- ArbEnv.getAttributeStore
+          allVars <- ArbEnv.askScope.map(scope => scope.keys.toList)
+          writeOnly = allVars.filter(store(_).writeOnly)
+          remaining = allVars.diff(writeOnly)
+        } yield remaining
+
       for {
-        source <- genName
-        sourceBoundVar <- unsafeGetBoundVar(source)
-        pattern = createVarRef
-        _ <- Attributes.addPattern(pattern, source)
-        _ <- FlatMap[EnvT[Gen, ?]].ifM(Attributes.hasReadOnly(source))(
-          ifTrue = Attributes.setReadOnlyFlag(pattern),
-          ifFalse = ArbEnv.pure
-        )
-      } yield (ReceiveBind(patterns = List(EVar(FreeVar(0))), source = EVar(sourceBoundVar), freeCount = 1), pattern)
+        // Only receive on vars that are not write-only bundles
+        vars <- readableVars
+        maybeResult <- if (vars.nonEmpty) {
+          for {
+            source <- ArbEnv.liftF(Gen.oneOf(vars))
+            sourceBoundVar <- unsafeGetBoundVar(source)
+            pattern = createVarRef
+            _ <- Attributes.addPattern(pattern, source)
+            _ <- FlatMap[EnvT[Gen, ?]].ifM(Attributes.hasReadOnly(source))(
+              ifTrue = Attributes.setReadOnlyFlag(pattern),
+              ifFalse = ArbEnv.pure
+            )
+            _ <- FlatMap[EnvT[Gen, ?]].ifM(Attributes.hasWriteOnly(source))(
+              ifTrue = Attributes.setWriteOnlyFlag(pattern),
+              ifFalse = ArbEnv.pure
+            )
+          } yield (ReceiveBind(patterns = List(EVar(FreeVar(0))), source = EVar(sourceBoundVar), freeCount = 1), pattern).some
+        } else ArbEnv.liftF(none[(ReceiveBind, VarRef)])
+      } yield maybeResult
     }
 
     def genBody(patternVar: VarRef): EnvT[Gen, Par] =
       for {
-        scope     <- ArbEnv.askScope
-        level     <- ArbEnv.askLevel
+        scope <- ArbEnv.askScope
+        level <- ArbEnv.askLevel
         levelBody = level + 1
         scopeBody = Map(patternVar -> Pos(level = levelBody, index = 0))
         body <- ReaderT.local(
-                 setScope(scope ++ scopeBody) andThen setLevel(levelBody) andThen decreaseSize
-               )(ArbF.arbF[EnvT, Par])
+          setScope(scope ++ scopeBody) andThen setLevel(levelBody) andThen decreaseSize
+        )(ArbF.arbF[EnvT, Par])
       } yield body
 
-    ArbF[EnvT, Receive](Defer[EnvT[Gen, ?]].defer {
+    ArbF[EnvT, Option[Receive]](Defer[EnvT[Gen, ?]].defer {
       for {
-        r            <- genReceiveBind
-        (receiveBind, pattern) = r
-        body         <- genBody(pattern)
-        isPersistent <- ArbEnv.liftF(Gen.oneOf(true, false))
-      } yield
-        Receive(
-          binds = List(receiveBind),
-          body = body,
-          persistent = isPersistent
-        )
+        maybeResult <- genReceiveBind
+        maybeReceive <- maybeResult match {
+          case None => ArbEnv.liftF(none[Receive])
+          case Some(result) =>
+            val (receiveBind, pattern) = result
+            for {
+              body <- genBody(pattern)
+              isPersistent <- ArbEnv.liftF(Gen.oneOf(true, false))
+            } yield
+              Receive(
+                binds = List(receiveBind),
+                body = body,
+                persistent = isPersistent
+              ).some
+        }
+      } yield maybeReceive
     })
   }
 
@@ -309,8 +372,8 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
                 news  <- ReaderT.local(setLevel(level + 1))(genShaped[New](nNews))
                 // TODO: Redistribute size of Nones
                 sends    <- genShaped[Option[Send]](nSends)
-                receives <- genShaped[Receive](nReceives)
-              } yield Par(sends = sends.flatten, receives = receives, news = news)
+                receives <- genShaped[Option[Receive]](nReceives)
+              } yield Par(sends = sends.flatten, receives = receives.flatten, news = news)
             } else nil
     } yield par
   })
@@ -446,7 +509,7 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
     Arbitrary(
       // Run with 5 names introduced by initial `new` and a size of 10
       // Env = (NewVarCount, Level, Size, Scope)
-      ev.arb.run((5, 0, 10, Map())).runA(Map()).map(ValidExp)
+      ev.arb.run((5, 0, 50, Map())).runA(Map()).map(ValidExp)
     )
 
   implicit override val generatorDrivenConfig: PropertyCheckConfiguration =
@@ -468,8 +531,6 @@ class SubSpec extends FlatSpec with Matchers with PropertyChecks {
         println()
         success(print(v.e)).runSyncUnsafe(3.seconds)
       } catch {
-        //case e: TimeoutException =>
-        //succeed
         case e: Throwable =>
           e match {
             case _: TimeoutException => succeed
