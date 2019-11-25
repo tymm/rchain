@@ -13,6 +13,7 @@ import coop.rchain.casper.util.rholang.SystemDeployPlatformFailure._
 import coop.rchain.casper.util.rholang.SystemDeployUserError._
 import coop.rchain.casper.util.rholang.costacc.{PreChargeDeploy, RefundDeploy}
 import coop.rchain.casper.util.{ConstructDeploy, EventConverter}
+import coop.rchain.crypto.PublicKey
 import coop.rchain.crypto.codec.Base16
 import coop.rchain.crypto.hash.Blake2b512Random
 import coop.rchain.crypto.signatures.Signed
