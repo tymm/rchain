@@ -43,8 +43,7 @@ def start_node(command_line_options: CommandLineOptions, docker_client: DockerCl
     }
 
     with testing_context(command_line_options, random_generator, docker_client, wallets_dict=genesis_vault) as context, \
-            started_bootstrap_with_network(context=context) as bootstrap:
-            wait_for_approved_block_received_handler_state(context, bootstrap)
+            started_bootstrap_with_network(context=context, wait_for_approved_block=True) as bootstrap:
             yield bootstrap
 
 
